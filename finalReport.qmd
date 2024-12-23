@@ -1,0 +1,271 @@
+---
+title: "finalProject"
+author: "Ellie Smartt"
+format: pdf
+editor: visual
+---
+
+1.  Untar the folder and extract the files.
+
+```{r}
+untar("brca_tcga_pan_can_atlas_2018.tar")
+```
+
+2.  Read the RNA-seq file: data_mrna_seq_v2_resem.txt
+
+```{r}
+folder_path = paste(getwd(), "brca_tcga_pan_can_atlas_2018", sep = "/")
+
+data_RNA_seq_path = paste(folder_path, "data_mrna_seq_v2_rsem.txt", sep = "/")
+data_RNA_seq = read.delim(data_RNA_seq_path)
+```
+
+3.  Read the Patient Data file: data_clinical_patient.txt
+
+```{r}
+data_patient_path = paste(folder_path, "data_clinical_patient.txt", sep = "/")
+data_patient = read.delim(data_patient_path)
+data_patient = data_patient[5:dim(data_patient)[1],]
+```
+
+4.  Read the Copy Number Aberrations Data: data_cna
+
+```{r}
+data_cna_path = paste(folder_path, "data_cna.txt", sep = "/") 
+data_cna = read.delim(data_cna_path)
+```
+
+5.  Match the RNA-seq patient ids with the CNA ids and the Patient Data ids.
+
+```{r}
+clean_barcode = function(barcode) {
+  barcode = substr(barcode, 1, 12)
+  barcode = gsub("\\.", "-", barcode)
+  return(barcode)
+}
+
+pat_ids = data_patient[, 1]
+rnaseq_ids = colnames(data_RNA_seq)[3:ncol(data_RNA_seq)]
+cna_ids = colnames(data_cna)[3:ncol(data_cna)]
+
+rnaseq_ids_clean = clean_barcode(rnaseq_ids)
+cna_ids_clean = clean_barcode(cna_ids)
+pat_ids_clean = clean_barcode(pat_ids)
+
+common_ids = intersect(intersect(rnaseq_ids_clean, cna_ids_clean), pat_ids_clean)
+
+rnaseq_idx = which(rnaseq_ids_clean %in% common_ids)
+cna_idx = which(cna_ids_clean %in% common_ids)
+patient_idx = which(pat_ids_clean %in% common_ids)
+
+rnaseq_matched = data_RNA_seq[, c(1:2, rnaseq_idx + 2)]
+cna_matched = data_cna[, c(1:2, cna_idx + 2)]           
+patient_matched = data_patient[patient_idx, ] 
+```
+
+6.  Create metadata using the CNA level of ERBB2+ (greater than 0 means amplified).
+
+```{r}
+assay = round(as.matrix(rnaseq_matched[, -c(1, 2)]))
+rownames(assay) = rnaseq_matched[, 1]
+
+metadata = matrix(0, dim(assay)[2], 1)
+erbb2_idx = which(cna_matched$Hugo_Symbol == "ERBB2")
+
+for (i in 1:dim(assay)[2]) {
+  metadata[i, 1] = 1*(as.numeric(cna_matched[erbb2_idx, i+2]) > 0)
+}
+
+metadata[is.na(metadata)] = 0
+
+colnames(metadata) = c("ERBB2_amp")
+
+amp_samples = sum(metadata == 1)
+non_amp_samples = sum(metadata == 0)
+
+print(amp_samples)
+print(non_amp_samples)
+
+barplot(table(metadata),
+        main = "Sample Distribution",
+        names.arg = c("Non-amplified", "Amplified"),
+        ylab = "Number of Samples",
+        ylim = c(0, 800),
+        col = c("darkgreen", "lightblue"),  
+        axes = FALSE)  
+
+axis(2, seq(0, 800, by = 100), las = 1)
+axis(1, at = c(0.7, 1.9), labels = FALSE, lwd = 1)  
+
+```
+
+7.  Normalise data using DESeq2.
+
+```{r}
+if(!require("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+if(!require("DESeq2", quietly = TRUE)) {
+  BiocManager::install("DESeq")
+}
+
+library(DESeq2)
+
+assay[is.na(assay)] = 0
+assay[assay < 0] = 0
+
+smallestGroupSize = 3
+keep = rowSums(assay >- 10) >= smallestGroupSize
+assay = assay[keep, ]
+
+dds = DESeqDataSetFromMatrix(countData = assay,
+                             colData = metadata,
+                             design = ~ ERBB2_amp)
+
+dds = DESeq(dds)
+resultsNames(dds)
+```
+
+8.  Obtain Differentially Expressed Genes.
+
+```{r}
+res = results(dds)
+res[order(res$padj)[1:10], ]
+```
+
+9.  Perform a Pathway Enrichment Analysis.
+
+```{r}
+
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) {
+  BiocManager::install("clusterProfiler")
+}
+
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+  BiocManager::install("org.Hs.eg.db")
+}
+
+if(!requireNamespace("enrichplot", quietly = TRUE)) {
+  install.packages("enrichplot")
+}
+
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+
+res_clean = res[!is.na(res$padj), ]
+res_sig = res_clean[res_clean$padj < 0.05, ]
+
+DE_over = rownames(res_sig[res_sig$log2FoldChange > 0, ])
+DE_under = rownames(res_sig[res_sig$log2FoldChange < 0, ])
+
+go_results_over = enrichGO (
+  gene = DE_over,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+print(head(go_results_over))
+```
+
+```{r}
+library(ggplot2)
+
+dotplot(go_results_over, showCategory = 10) + ggtitle("Gene Ontology Enrichment Over Expression") 
+```
+
+```{r}
+go_results_under = enrichGO(
+  gene          = DE_under,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",  
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+print(head(go_results_under))
+```
+
+```{r}
+dotplot(go_results_under, showCategory = 10) + ggtitle("Gene Ontology Enrichment Under Expressed")
+```
+10. Get the variance stabilised transformed expression values.
+
+```{r}
+vsd = vst(dds)
+
+par(mfrow = c(1, 2)) 
+```
+
+11. With the vst values obtain a PCA plot and a heatmap.
+
+```{r}
+plotPCA(vsd, intgroup = c("ERBB2_amp"))
+```
+
+```{r}
+if(!requireNamespace("pheatmap", quietly = TRUE)) {
+  install.packages("pheatmap")
+}
+
+library(pheatmap)
+
+top_DE = order(res$padj)
+
+vsd_DE = assay(vsd)[top_DE[1:20], ]
+
+annotation_col = data.frame(ERBB2_Status = metadata[ , 1])
+rownames(annotation_col) = colnames(vsd)
+
+pheatmap (
+  vsd_DE,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  scale = "row",
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  annotation_col = annotation_col
+)
+```
+
+12. With the vst values of the DE genes generate an overall survival model using the glmnet package.
+
+```{r}
+if (!requireNamespace("glmnet", quietly = TRUE)) {
+  install.packages("glmnet", "survival")
+}
+
+library(glmnet)
+library(survival)
+
+de_genes = rownames(res_sig) 
+vsd_de = assay(vsd)[de_genes,]
+
+survival_time = as.numeric(patient_matched$Overall.Survival..Months.)
+survival_status = as.numeric(patient_matched$Overall.Survival.Status == "1:DECEASED")
+
+valid_cases = survival_time > 0
+
+survival_time = survival_time[valid_cases]
+survival_status = survival_status[valid_cases]
+vsd_de_filtered = vsd_de[, valid_cases]
+
+y = Surv(survival_time, survival_status)
+x = t(vsd_de_filtered)
+
+fit = glmnet(x, y, family = "cox", alpha = 1)
+cv.fit = cv.glmnet(x, y, family="cox")
+plot(cv.fit)
+```
+
+```{r}
+sfit = survfit(cv.fit, x = x, y = y, s=c("lambda.1se", "lambda.min"))
+plot(sfit, xlab="Months", ylab="Survival Probability")
+```
